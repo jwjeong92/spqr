@@ -175,7 +175,7 @@ def get_loaders(name, nsamples=128, seed=0, seqlen=2048, eval_mode=False, model_
     if name.lower() == "pajama":
         data = torch.load("./lib/spqr/data/red_pajama_n=1024.pth")[:nsamples]
     elif name.lower() == "refinedweb":
-        data = torch.load("./data/refined_web_n=128.pth")[:nsamples]
+        data = torch.load("./lib/spqr/data/refined_web_n=128.pth")[:nsamples]
     elif name.lower() == "none":
         print("Not loading any dataset. (OK if you use no compression or methods like RTN.)")
         return None

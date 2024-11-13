@@ -8,8 +8,8 @@ from tqdm.auto import tqdm
 import gc
 import numpy as np
 
-from lib.spqr.quant_groups import Quantizer, dequantize, quantize
-from lib.spqr.weight_permutation import get_permutation_order
+from .quant_groups import Quantizer, dequantize, quantize
+from .weight_permutation import get_permutation_order
 
 def calculate_bit_error_injection_mask_quantized(X, ber=1e-2, seed=42, bitwidth=8, percentile=99):
     gen = torch.Generator()
@@ -104,25 +104,98 @@ class SPQRUtil:
         self.nsamples += tmp
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         self.H += inp.matmul(inp.t())
+
+    def collect_quant_loss(
+        self,
+        *,
+        bits: int = 4,
+        percdamp: float = 1e-2,
+        groupsize: Optional[int] = None,
+        keep_last_columns: int = 0,
+        permutation_order: Union[str, torch.Tensor] = "identity",
+        keep_H: bool = True,
+        perchannel: bool = True,
+        sym: bool = False,
+        verbose=True,
+        eval_ppl=True,
+        **kwargs,
+    ):
+        weight = self.layer.weight.detach().to(dtype=torch.float, copy=True)
+        perm = get_permutation_order(self.H, weight, permutation_order)
         
+        weight = weight[:, perm]  # note: weight is modified
+        H = self.H
+        if keep_H:
+            H = H.clone()  # protect from in-place changes
+        else:
+            self.H = None
+
+        H = H[perm][:, perm]
+        self.dead = torch.diag(H) == 0  # indices of input features that do not affect outputs
+        if percdamp > 0:
+            ix = torch.arange(len(H), device=weight.device)
+            H[ix, ix] += percdamp * abs(torch.diag(H)).mean()
+            del ix
+        H[self.dead, self.dead] = 1
+        weight[:, self.dead] = 0
+        H_inv = torch.cholesky_inverse(torch.linalg.cholesky(H))
+        H_inv_diag = torch.diag(H_inv)
+        del H, H_inv
+
+        out_dim, in_dim = weight.shape  # [out_features, in_features]
+
+        if groupsize is None:
+            groupsize = in_dim
+
+        # groupwise quantization
+        assert in_dim % groupsize == 0
+
+        group_start_iter = range(0, in_dim - keep_last_columns, groupsize)
+        group_start_iter = tqdm(group_start_iter, leave=False) if verbose else group_start_iter
+
+        dequantized_weight = torch.zeros_like(weight)
+        quant_sensitivity = torch.zeros_like(weight)
+        for group_start in group_start_iter:
+            group_weight = weight[:, group_start : group_start + groupsize]
+
+            group_diag_hessian_inv = H_inv_diag[group_start : group_start + groupsize]
+
+            quantizer = Quantizer()
+            quantizer.configure(bits, perchannel=perchannel, sym=sym, **kwargs)
+            quantizer.find_params(x=group_weight, weight=True) # get scales, zeros for the weight tensor
+            
+            group_reconstructed_weight = quantizer.quantize_dequantize(group_weight)
+
+            group_weight_sensitivity = (
+                ((group_reconstructed_weight - group_weight).square() / group_diag_hessian_inv)
+            )
+            quant_sensitivity[:, group_start : group_start + groupsize] = group_weight_sensitivity
+            dequantized_weight[:, group_start : group_start + groupsize] = group_reconstructed_weight
+
+        if permutation_order != "identity":
+            invperm = torch.argsort(perm)
+            quant_sensitivity = quant_sensitivity[:, invperm]
+            dequantized_weight = dequantized_weight[:, invperm]
+            
+        if eval_ppl:
+            self.layer.weight.data = dequantized_weight.to(self.layer.weight.dtype)
+        return quant_sensitivity
+
     def collect_quant_bf_loss(
         self,
         *,
         bits: int = 3,
-        blocksize: int = 16,
         percdamp: float = 1e-2,
         groupsize: Optional[int] = None,
         keep_last_columns: int = 0,
         permutation_order: Union[str, torch.Tensor] = "identity",
         keep_H: bool = True,
-        verbose=True,
         perchannel: bool = True,
         sym: bool = False,
+        verbose=True,
         ber: float = 1e-4,
         seed: int = 42,
         percentile: int = 100,
-        quant_only: bool = True,
-        bf_matrix_required: bool = False,
         **kwargs,
     ):
         weight = self.layer.weight.detach().to(dtype=torch.float, copy=True)
@@ -144,188 +217,82 @@ class SPQRUtil:
         H[self.dead, self.dead] = 1
         weight[:, self.dead] = 0
         H_inv = torch.cholesky_inverse(torch.linalg.cholesky(H))
-        H_inv_cho = torch.linalg.cholesky(H_inv, upper=True)
-        H_inv_cho_diag = torch.diag(H_inv_cho)
-        del H
-        del H_inv
+        H_inv_diag = torch.diag(H_inv)
+        del H, H_inv
 
-        quantizer = Quantizer()
-        quantizer.configure(bits, perchannel=perchannel, sym=sym, **kwargs)
-        assert H_inv_cho.shape[0] == H_inv_cho.shape[1] == weight.shape[1], "weight must be [out_features, in_features]"
         out_dim, in_dim = weight.shape  # [out_features, in_features]
 
         if groupsize is None:
             groupsize = in_dim
 
+        # groupwise quantization
+        assert in_dim % groupsize == 0
         in_group_index = -1
         
-        quantizer.find_params(x=weight, weight=True) # get scales, zeros for the weight tensor
+        quant_stats = {
+            "scales": [],
+            "zeros": [],
+        }
         
-        baseline_reconstructed_weight = quantizer.quantize_dequantize(weight)
-        baseline_errors_sq = (
-            ((baseline_reconstructed_weight - weight) / H_inv_cho_diag).square()
-        )
-        if quant_only:
-            if permutation_order != "identity":
-                invperm = torch.argsort(perm)
-                baseline_errors_sq = baseline_errors_sq[:, invperm]
-                baseline_reconstructed_weight = baseline_reconstructed_weight[:, invperm]
-            
-            self.layer.weight.data = baseline_reconstructed_weight.to(self.layer.weight.dtype)
-            return baseline_errors_sq
+        quant_weight = torch.zeros_like(weight)
+        quant_sensitivity = torch.zeros_like(weight)
 
-        quant_weight_i = quantize(weight, quantizer.scale, quantizer.zero, quantizer.maxq)
+        group_start_iter = range(0, in_dim - keep_last_columns, groupsize)
+        group_start_iter = tqdm(group_start_iter, leave=False) if verbose else group_start_iter
+
+        for group_start in group_start_iter:
+            group_end = min(group_start + groupsize, in_dim)
+            in_group_index += 1
+            group_weight = weight[:, group_start : group_start + groupsize]
+
+            group_diag_hessian_inv = H_inv_diag[group_start : group_start + groupsize]
+
+            quantizer = Quantizer()
+            quantizer.configure(bits, perchannel=perchannel, sym=sym, **kwargs)
+            quantizer.find_params(x=group_weight, weight=True) # get scales, zeros for the weight tensor
+            
+            quant_stats["scales"].append(quantizer.scale)
+            quant_stats["zeros"].append(quantizer.zero)
+
+            group_reconstructed_weight = quantize(group_weight, quantizer.scale, quantizer.zero, quantizer.maxq)
+            quant_weight[:, group_start : group_start + groupsize] = group_reconstructed_weight
+            group_reconstructed_weight = dequantize(group_reconstructed_weight, quantizer.scale, quantizer.zero)
+
+            group_weight_sensitivity = (
+                ((group_reconstructed_weight - group_weight).square() / group_diag_hessian_inv)
+            )
+            quant_sensitivity[:, group_start : group_start + groupsize] = group_weight_sensitivity
+
         # generate error matrix
         bf_tensor = calculate_bit_error_injection_mask_quantized(
-            quant_weight_i,
+            quant_sensitivity,
             ber = ber,
             seed = seed,
             bitwidth = bits,
             percentile=percentile # wo outlier
-        ).reshape_as(quant_weight_i).to(quant_weight_i.device)
-
-        if bf_matrix_required:
-            if permutation_order != "identity":
-                invperm = torch.argsort(perm)
-                bf_tensor = bf_tensor[:, invperm]
-                return bf_tensor.to("cpu")
-            
-        quant_weight_i = quant_weight_i.to(torch.int32) ^ bf_tensor.to(dtype=torch.int32)
-        bf_dequant_weight = dequantize(quant_weight_i, quantizer.scale, quantizer.zero)
-        bf_error_sq = (
-            ((bf_dequant_weight - weight) / H_inv_cho_diag).square()
+        ).reshape_as(quant_weight).to(quant_weight.device)
+        
+        quant_weight = quant_weight.to(torch.int32) ^ bf_tensor.to(dtype=torch.int32)
+        bf_dequant_weight = torch.zeros_like(weight)
+        for i in range(len(quant_stats['scales'])):
+            bf_dequant_weight[:, i*groupsize : (i+1)*groupsize] = dequantize(
+                quant_weight[:, i*groupsize : (i+1)*groupsize], 
+                quant_stats['scales'][i], 
+                quant_stats['zeros'][i]
+            )
+        bf_sensitivity = (
+            ((bf_dequant_weight - weight).square() / H_inv_diag)
         )
-
-        reduction_in_squared_error = bf_error_sq - baseline_errors_sq
 
         if permutation_order != "identity":
             invperm = torch.argsort(perm)
             bf_dequant_weight = bf_dequant_weight[:, invperm]
-            reduction_in_squared_error = reduction_in_squared_error[:, invperm]
+            bf_sensitivity = bf_sensitivity[:, invperm]
+            bf_tensor = bf_tensor[:, invperm]
 
         self.layer.weight.data = bf_dequant_weight.to(self.layer.weight.dtype)
 
-        return reduction_in_squared_error.to("cpu")
-
-    def collect_sense(
-        self,
-        *,
-        bits: int = 3,
-        blocksize: int = 16,
-        percdamp: float = 1e-2,
-        groupsize: Optional[int] = None,
-        keep_last_columns: int = 0,
-        permutation_order: Union[str, torch.Tensor] = "identity",
-        keep_H: bool = True,
-        verbose=True,
-        perchannel: bool = True,
-        sym: bool = False,
-        **kwargs,
-    ) -> Dict[torch.Tensor]:
-        weight = self.layer.weight.detach().to(dtype=torch.float, copy=True)
-        perm = get_permutation_order(self.H, weight, permutation_order)
-        
-        weight = weight[:, perm]  # note: weight is modified
-        H = self.H
-        if keep_H:
-            H = H.clone()  # protect from in-place changes
-        else:
-            self.H = None
-
-        H = H[perm][:, perm]
-        self.dead = torch.diag(H) == 0  # indices of input features that do not affect outputs
-        if percdamp > 0:
-            ix = torch.arange(len(H), device=weight.device)
-            H[ix, ix] += percdamp * abs(torch.diag(H)).mean()
-            del ix
-        H[self.dead, self.dead] = 1
-        weight[:, self.dead] = 0
-        H_inv = torch.cholesky_inverse(torch.linalg.cholesky(H))
-        H_inv_cho = torch.linalg.cholesky(H_inv, upper=True)
-        H_inv_cho_diag = torch.diag(H_inv_cho)
-        del H
-        del H_inv
-
-        quantizer = Quantizer()
-        quantizer.configure(bits, perchannel=perchannel, sym=sym, **kwargs)
-        assert H_inv_cho.shape[0] == H_inv_cho.shape[1] == weight.shape[1], "weight must be [out_features, in_features]"
-        out_dim, in_dim = weight.shape  # [out_features, in_features]
-
-        if groupsize is None:
-            groupsize = in_dim
-
-        in_group_index = -1
-        
-        quantizer.find_params(x=weight, weight=True) # get scales, zeros for the weight tensor
-        
-        baseline_reconstructed_weight = quantizer.quantize_dequantize(weight)
-        baseline_errors_sq = (
-            ((baseline_reconstructed_weight - weight) / H_inv_cho_diag).square().sum(dim=1, keepdim=True)
-        )
-        '''
-        reduction_in_squared_error = torch.zeros_like(weight)
-        p_factor = 1
-        assert weight.shape[1] % p_factor == 0
-        reduction_in_squared_error = get_sensitivity_parallel(p_factor, weight, H_inv_cho_diag, bits=bits, sym=sym)
-        '''
-        if permutation_order != "identity":
-            invperm = torch.argsort(perm)
-            #reduction_in_squared_error = reduction_in_squared_error[:, invperm]
-            baseline_errors_sq = baseline_errors_sq[:, invperm]
-        
-        return baseline_errors_sq.to("cpu")
-    
-    def quant_loss_per_weight(
-        self,
-        *,
-        bits: int = 2,
-        blocksize: int = 128,
-        percdamp: float = 1e-2,
-        groupsize: Optional[int] = None,
-        keep_last_columns: int = 0,
-        outlier_relative_threshold: float = float("inf"),
-        permutation_order: Union[str, torch.Tensor] = "identity",
-        keep_H: bool = True,
-        simplified_outliers: bool = False,
-        verbose=True,
-        perchannel: bool = True,
-        sym: bool = False,
-        save_quantization: bool = False,
-        **kwargs,
-    ):
-        weight = self.layer.weight.detach().to(dtype=torch.float, copy=True)
-        perm = get_permutation_order(self.H, weight, permutation_order)
-        weight = weight[:, perm]  # note: weight is modified
-        H = self.H
-        if keep_H:
-            H = H.clone()  # protect from in-place changes
-        else:
-            self.H = None
-
-        H = H[perm][:, perm]
-        self.dead = torch.diag(H) == 0  # indices of input features that do not affect outputs
-        if percdamp > 0:
-            ix = torch.arange(len(H), device=weight.device)
-            H[ix, ix] += percdamp * abs(torch.diag(H)).mean()
-            del ix
-        H[self.dead, self.dead] = 1
-        weight[:, self.dead] = 0
-        H_inv = torch.cholesky_inverse(torch.linalg.cholesky(H))
-        H_inv_cho = torch.linalg.cholesky(H_inv, upper=True)
-        H_inv_cho_diag = torch.diag(H_inv_cho)
-        del H, H_inv
-
-        quantizer = Quantizer()
-        quantizer.configure(bits, perchannel=perchannel, sym=sym, **kwargs)
-        assert H_inv_cho.shape[0] == H_inv_cho.shape[1] == weight.shape[1], "weight must be [out_features, in_features]"
-        out_dim, in_dim = weight.shape  # [out_features, in_features]
-
-        if groupsize is None:
-            groupsize = in_dim
-
-        quantizer.find_params(x=weight, weight=True) # get scales, zeros for the weight tensor
-        
-
+        return bf_sensitivity.to("cpu"), bf_tensor.to("cpu")
 
     def quantize(
         self,

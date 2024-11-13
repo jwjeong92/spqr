@@ -173,10 +173,12 @@ def collect_quant_bf_loss(model, dataloader, args, device):
 
     layers = get_layers(model)
     quant_bf_loss = {}
+    bf_errors = {}
 
     seed = args.seed
     for i in range(len(layers)):
         quant_bf_loss[i] = {}
+        bf_errors[i] = {}
         print(f"\n---------------- Layer {i} of {len(layers)} ----------------")
         start_time = time.time()
         
@@ -226,7 +228,7 @@ def collect_quant_bf_loss(model, dataloader, args, device):
             torch.cuda.empty_cache()
             for sublayer_name in subset:
                 print(f"Collecting quant_bf-ed of module {sublayer_name} of layer {i}")
-                quant_bf_loss[i][sublayer_name] = spqr_handler[sublayer_name].collect_quant_bf_loss(
+                quant_bf_loss[i][sublayer_name], bf_errors[i][sublayer_name] = spqr_handler[sublayer_name].collect_quant_bf_loss(
                     percdamp=args.percdamp,
                     bits=args.wbits,
                     groupsize=args.groupsize,
@@ -237,12 +239,10 @@ def collect_quant_bf_loss(model, dataloader, args, device):
                     ber=args.ber,
                     seed=seed,
                     percentile=args.percentile,
-                    quant_only=args.quant_only,
-                    bf_matrix_required=args.bf_required,
                 )
                 seed = seed + 10
 
-    return quant_bf_loss
+    return quant_bf_loss, bf_errors
 
 
 def get_quant_bf_loss(model, args, device):
@@ -256,10 +256,10 @@ def get_quant_bf_loss(model, args, device):
         seqlen=model.seqlen,
     )
 
-    results = collect_quant_bf_loss(model, dataloader, args, device)
+    results, errors = collect_quant_bf_loss(model, dataloader, args, device)
 
     print(f"quant_bf time: {time.time() - tick:.1f}")
-    return results
+    return results, errors
 
 def main():
     import argparse
@@ -394,15 +394,6 @@ def main():
         "--percentile",
         type=float,
     )
-    parser.add_argument(
-        "--quant_only",
-        action="store_true",
-        help="get only baseline quant.",
-    )
-    parser.add_argument(
-        "--bf_required",
-        action="store_true",
-    )
 
     args = parser.parse_args()
 
@@ -436,27 +427,24 @@ def main():
     model = get_model(args.model_path, args.load, args.dtype).train(False)
     # quantization + error 로 인한 sensitivity 변화 관찰
     
-    results = get_quant_bf_loss(model, args, device)
+    results, errors = get_quant_bf_loss(model, args, device)
 
     df = pd.DataFrame(results)
+    df_err = pd.DataFrame(errors)
 
-    if args.quant_only:
-        results_name = f'opt-125m-w{args.wbits}.pt'
-    elif args.bf_required:
-        results_name = f'errors-w{args.wbits}-bf{args.ber:.0e}-seed{args.seed}.pt'
-    else:
-        results_name = f'opt-125m-w{args.wbits}-bf{args.ber:.0e}-seed{args.seed}.pt'
+    results_name = f'opt-125m-w{args.wbits}-bf{args.ber:.0e}-seed{args.seed}.pt'
+    if args.groupsize is not None:
+        results_name = f'opt-125m-w{args.wbits}-gs{args.groupsize}-bf{args.ber:.0e}-seed{args.seed}.pt'
+
+    errors_name = f'errors/errors-w{args.wbits}-bf{args.ber:.0e}-seed{args.seed}.pt'
     
-    if args.bf_required:
-        folder_name = 'quant_bf_results/errors'
-    else:
-        folder_name = 'quant_bf_results'
+    folder_name = '/raid/jwjeong/quant_bf_results_new'
+    
     torch.save(df.to_dict(), f'{folder_name}/{results_name}')
+    torch.save(df_err.to_dict(), f'{folder_name}/{errors_name}')
 
-    if not args.bf_required:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-        print(f'eval. quant bf model: {evaluate_perplexity(model.to(device), tokenizer)}')
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    print(f'eval. quant bf model: {evaluate_perplexity(model.to(device), tokenizer)}')
     
-
 if __name__ == '__main__':
     main()

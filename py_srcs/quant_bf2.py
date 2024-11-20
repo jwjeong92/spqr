@@ -229,7 +229,6 @@ def collect_quant_bf_loss(model, dataloader, args, device):
             for sublayer_name in subset:
                 print(f"Collecting quant_bf-ed of module {sublayer_name} of layer {i}")
                 quant_bf_loss[i][sublayer_name] = spqr_handler[sublayer_name].collect_quant_bf_loss(
-                    layer_name=sublayer_name,
                     percdamp=args.percdamp,
                     bits=args.wbits,
                     groupsize=args.groupsize,
@@ -240,9 +239,6 @@ def collect_quant_bf_loss(model, dataloader, args, device):
                     ber=args.ber,
                     seed=seed,
                     percentile=args.percentile,
-                    error_extract=args.error_extract,
-                    with_sign=args.with_sign,
-                    target_layer = args.target_layer,
                 )
                 seed = seed + 10
 
@@ -398,18 +394,6 @@ def main():
         "--percentile",
         type=float,
     )
-    parser.add_argument(
-        "--error_extract",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--with_sign",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--target_layer",
-        type=str, nargs='+', help="List of layer names"
-    )
 
     args = parser.parse_args()
 
@@ -447,31 +431,14 @@ def main():
 
     df = pd.DataFrame(results)
 
+    results_name = f'opt-125m-w{args.wbits}-bf{args.ber:.0e}-seed{args.seed}.pt'
     if args.groupsize is not None:
-        if args.error_extract:
-            results_name = f'errors-w{args.wbits}-gs{args.groupsize}-bf{args.ber:.0e}-seed{args.seed}.pt'
-        else:
-            results_name = f'opt-125m-w{args.wbits}-gs{args.groupsize}-bf{args.ber:.0e}-seed{args.seed}.pt'
-    else:
-        if args.error_extract:
-            results_name = f'errors-w{args.wbits}-bf{args.ber:.0e}-seed{args.seed}.pt'
-        else:
-            results_name = f'opt-125m-w{args.wbits}-bf{args.ber:.0e}-seed{args.seed}.pt'
+        results_name = f'opt-125m-w{args.wbits}-gs{args.groupsize}-bf{args.ber:.0e}-seed{args.seed}.pt'
+
+    errors_name = f'errors/errors-w{args.wbits}-bf{args.ber:.0e}-seed{args.seed}.pt'
     
-    if args.error_extract:
-        folder_name = 'errors'
-    else:
-        if args.with_sign:
-            folder_name = 'quant_bf_results_nogroups_w_sign'
-        else:
-            folder_name = 'quant_bf_results_nogroups'
+    folder_name = 'quant_bf_results_gs16'
     
-    if not os.path.exists(folder_name):
-        os.makedirs(folder_name)
-        print(f"Directory Created: {folder_name}")
-    else:
-        print(f'Directory already exists: {folder_name}')
-        
     torch.save(df.to_dict(), f'{folder_name}/{results_name}')
     #torch.save(df_err.to_dict(), f'{folder_name}/{errors_name}')
 

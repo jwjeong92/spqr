@@ -5,7 +5,7 @@ import torch.nn as nn
 from tqdm import trange
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from lib.spqr.quant_groups import dequantize
+from .quant_groups import dequantize
 
 MODEL_ERROR_MSG = "Unsupported model type {} - only 'llama', 'Yi', 'opt' and 'falcon' are supported"
 FALCON_TYPES = ("falcon", "refinedweb", "refinedwebmodel")

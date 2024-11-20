@@ -2,3 +2,7 @@
 *.png
 *.ipynb
 *.log
+*.html
+*.swp
+*.csv
+*.pyc

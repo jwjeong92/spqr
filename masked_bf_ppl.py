@@ -156,7 +156,7 @@ def get_inps(model, data_iterable, args, dev, nsamples=None):
     return inps, forward_args
 
 @torch.no_grad()
-def collect_quant_bf_loss(model, dataloader, args, device):
+def inject_quant_bf(model, dataloader, args, device):
     print("\nStarting sensitivity collection ...")
 
     inps, forward_args = get_inps(
@@ -227,29 +227,21 @@ def collect_quant_bf_loss(model, dataloader, args, device):
             
             torch.cuda.empty_cache()
             for sublayer_name in subset:
-                print(f"Collecting quant_bf-ed of module {sublayer_name} of layer {i}")
-                quant_bf_loss[i][sublayer_name] = spqr_handler[sublayer_name].collect_quant_bf_loss(
-                    layer_name=sublayer_name,
+                print(f"Injecting quant_bf to module {sublayer_name} of layer {i}")
+                spqr_handler[sublayer_name].quant_mask_error(
                     percdamp=args.percdamp,
                     bits=args.wbits,
-                    groupsize=args.groupsize,
                     sym=args.sym,
                     perchannel=args.perchannel,
-                    round_zero=args.round_zero,
                     permutation_order=args.permutation_order,
                     ber=args.ber,
                     seed=seed,
                     percentile=args.percentile,
-                    error_extract=args.error_extract,
-                    with_sign=args.with_sign,
-                    target_layer = args.target_layer,
                 )
                 seed = seed + 10
 
-    return quant_bf_loss
 
-
-def get_quant_bf_loss(model, args, device):
+def quant_bf_injection(model, args, device):
     tick = time.time()
     print("Loading data ...")
     dataloader = get_loaders(
@@ -260,10 +252,9 @@ def get_quant_bf_loss(model, args, device):
         seqlen=model.seqlen,
     )
 
-    results = collect_quant_bf_loss(model, dataloader, args, device)
+    inject_quant_bf(model, dataloader, args, device)
 
     print(f"quant_bf time: {time.time() - tick:.1f}")
-    return results
 
 def main():
     import argparse
@@ -443,37 +434,7 @@ def main():
     model = get_model(args.model_path, args.load, args.dtype).train(False)
     # quantization + error 로 인한 sensitivity 변화 관찰
     
-    results = get_quant_bf_loss(model, args, device)
-
-    df = pd.DataFrame(results)
-
-    if args.groupsize is not None:
-        if args.error_extract:
-            results_name = f'errors-w{args.wbits}-gs{args.groupsize}-bf{args.ber:.0e}-seed{args.seed}.pt'
-        else:
-            results_name = f'opt-125m-w{args.wbits}-gs{args.groupsize}-bf{args.ber:.0e}-seed{args.seed}.pt'
-    else:
-        if args.error_extract:
-            results_name = f'errors-w{args.wbits}-bf{args.ber:.0e}-seed{args.seed}.pt'
-        else:
-            results_name = f'opt-125m-w{args.wbits}-bf{args.ber:.0e}-seed{args.seed}.pt'
-    
-    if args.error_extract:
-        folder_name = 'errors'
-    else:
-        if args.with_sign:
-            folder_name = 'quant_bf_results_nogroups_w_sign'
-        else:
-            folder_name = 'quant_bf_results_nogroups'
-    
-    if not os.path.exists(folder_name):
-        os.makedirs(folder_name)
-        print(f"Directory Created: {folder_name}")
-    else:
-        print(f'Directory already exists: {folder_name}')
-        
-    torch.save(df.to_dict(), f'{folder_name}/{results_name}')
-    #torch.save(df_err.to_dict(), f'{folder_name}/{errors_name}')
+    quant_bf_injection(model, args, device)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path)
     print(f'eval. quant bf model: {evaluate_perplexity(model.to(device), tokenizer)}')

@@ -2,11 +2,11 @@ import os
 import time
 
 os.environ["CUDA_DEVICE_ORDER"]="PCI_BUS_ID"  # Arrange GPU devices starting from 0
-os.environ["CUDA_VISIBLE_DEVICES"]= "3"  # Set the GPU 2 to use
+os.environ["CUDA_VISIBLE_DEVICES"]= "0"  # Set the GPU 2 to use
 
 import torch
 import torch.nn as nn
-from tqdm import trange
+from tqdm import trange, tqdm
 
 import pandas as pd
 
@@ -21,6 +21,8 @@ from lib.spqr.modelutils import (
     get_sequential_groups,
 )
 from lib.spqr.spqr_engine import Quantizer, SPQRUtil, quantize
+from transformers import AutoTokenizer
+from datasets import load_dataset
 
 try:
     import wandb
@@ -36,6 +38,43 @@ try:
 except ModuleNotFoundError:
     has_safetensors = False
 
+def evaluate_perplexity(model, tokenizer):
+    def _perplexity(nlls, n_samples, seqlen):
+        return torch.exp(torch.stack(nlls).sum() / (n_samples * seqlen))
+
+    # load and prepare dataset
+    data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    data = tokenizer("\n\n".join(data["text"]), return_tensors="pt")
+    data = data.input_ids.to(model.device)
+
+    seqlen = 2048
+    model = model.eval()
+    n_samples = data.numel() // seqlen
+
+    nlls = []
+
+    with tqdm(range(n_samples), desc="Perplexity -") as progress_bar:
+        for i in progress_bar:
+            start_index = i * seqlen
+            end_index = (i + 1) * seqlen
+            batch = data[:, start_index:end_index].to(model.device)
+            with torch.no_grad():
+                logits = model(batch).logits
+            shift_logits = logits[:, :-1, :].contiguous().float()
+            shift_labels = data[:, start_index:end_index][:, 1:]
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            )
+            neg_log_likelihood = loss.float() * seqlen
+            nlls.append(neg_log_likelihood)
+
+            curr_ppl = _perplexity(nlls, i + 1, seqlen)
+            progress_bar.set_description(f"Perplexity {curr_ppl:.3f}")
+
+    ppl = _perplexity(nlls, n_samples, seqlen)
+
+    return ppl.item()
 
 @torch.no_grad()
 def get_inps(model, data_iterable, args, dev, nsamples=None):
@@ -117,7 +156,7 @@ def get_inps(model, data_iterable, args, dev, nsamples=None):
     return inps, forward_args
 
 @torch.no_grad()
-def collect_sensitivity(model, dataloader, args, device):
+def quant_sensitivity_with_calib(model, dataloader, args, device):
     print("\nStarting sensitivity collection ...")
 
     inps, forward_args = get_inps(
@@ -133,9 +172,10 @@ def collect_sensitivity(model, dataloader, args, device):
     save = getattr(args, "save", False)
 
     layers = get_layers(model)
-    collected_sensitivity = {}
+    quant_loss = {}
+
     for i in range(len(layers)):
-        collected_sensitivity[i] = {}
+        quant_loss[i] = {}
         print(f"\n---------------- Layer {i} of {len(layers)} ----------------")
         start_time = time.time()
         
@@ -183,25 +223,23 @@ def collect_sensitivity(model, dataloader, args, device):
                 h.remove()
             
             torch.cuda.empty_cache()
-
             for sublayer_name in subset:
-                print(f"Collecting sensitivity of module {sublayer_name} of layer {i}")
-                collected_sensitivity[i][sublayer_name] = spqr_handler[sublayer_name].add_err_collect_sense(
+                print(f"Collecting quant_bf-ed of module {sublayer_name} of layer {i}")
+                quant_loss[i][sublayer_name] = spqr_handler[sublayer_name].collect_quant_loss(
                     percdamp=args.percdamp,
                     bits=args.wbits,
                     groupsize=args.groupsize,
                     sym=args.sym,
                     perchannel=args.perchannel,
                     round_zero=args.round_zero,
-                    permutation_order=args.permutation_order
-                )
+                    permutation_order=args.permutation_order,
+                ).to("cpu")
 
-    return collected_sensitivity
-            
+    return quant_loss
 
-def get_sensitivity(model, args, device):
+
+def get_quant_loss(model, args, device):
     tick = time.time()
-
     print("Loading data ...")
     dataloader = get_loaders(
         args.dataset,
@@ -211,9 +249,9 @@ def get_sensitivity(model, args, device):
         seqlen=model.seqlen,
     )
 
-    results = collect_sensitivity(model, dataloader, args, device)
+    results = quant_sensitivity_with_calib(model, dataloader, args, device)
 
-    print(f"sensitivity collection time: {time.time() - tick:.1f}")
+    print(f"quant_bf time: {time.time() - tick:.1f}")
     return results
 
 def main():
@@ -372,12 +410,21 @@ def main():
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = get_model(args.model_path, args.load, args.dtype).train(False)
-    results = get_sensitivity(model, args, device)
+    # quantization + error 로 인한 sensitivity 변화 관찰
+    
+    results = get_quant_loss(model, args, device)
 
     df = pd.DataFrame(results)
+    if args.groupsize is None:
+        results_name = f'opt-125m-w{args.wbits}.pt'
+    else:
+        results_name = f'opt-125m-w{args.wbits}-gs{args.groupsize}.pt'
+    folder_name = '/raid/jwjeong/quant_results'
+    torch.save(df.to_dict(), f'{folder_name}/{results_name}')
 
-    torch.save(df.to_dict(), 'collected_sensitivity.pt')
-
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    print(f'eval. quant bf model: {evaluate_perplexity(model.to(device), tokenizer)}')
+    
 
 if __name__ == '__main__':
     main()

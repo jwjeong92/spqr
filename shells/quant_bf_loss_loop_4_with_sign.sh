@@ -11,14 +11,15 @@ do
         echo "Running with BER=$BER and seed=$seed"
         
         python quant_bf.py $MODEL_PATH $DATASET \
-            --wbits 5 \
+            --wbits 4 \
             --perchannel \
             --permutation_order act_order \
             --percdamp 1e0 \
             --nsamples 128 \
             --ber $BER \
             --seed $seed \
-            --percentile 100
+            --percentile 100 \
+            --with_sign
         i=$((i + 1))
     done
     seed=$((seed + 1))

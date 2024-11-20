@@ -38,44 +38,6 @@ try:
 except ModuleNotFoundError:
     has_safetensors = False
 
-def evaluate_perplexity(model, tokenizer):
-    def _perplexity(nlls, n_samples, seqlen):
-        return torch.exp(torch.stack(nlls).sum() / (n_samples * seqlen))
-
-    # load and prepare dataset
-    data = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
-    data = tokenizer("\n\n".join(data["text"]), return_tensors="pt")
-    data = data.input_ids.to(model.device)
-
-    seqlen = 2048
-    model = model.eval()
-    n_samples = data.numel() // seqlen
-
-    nlls = []
-
-    with tqdm(range(n_samples), desc="Perplexity -") as progress_bar:
-        for i in progress_bar:
-            start_index = i * seqlen
-            end_index = (i + 1) * seqlen
-            batch = data[:, start_index:end_index].to(model.device)
-            with torch.no_grad():
-                logits = model(batch).logits
-            shift_logits = logits[:, :-1, :].contiguous().float()
-            shift_labels = data[:, start_index:end_index][:, 1:]
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
-            )
-            neg_log_likelihood = loss.float() * seqlen
-            nlls.append(neg_log_likelihood)
-
-            curr_ppl = _perplexity(nlls, i + 1, seqlen)
-            progress_bar.set_description(f"Perplexity {curr_ppl:.3f}")
-
-    ppl = _perplexity(nlls, n_samples, seqlen)
-
-    return ppl.item()
-
 @torch.no_grad()
 def get_inps(model, data_iterable, args, dev, nsamples=None):
     """mocks model launch to collect inputs to the first model layer"""
@@ -156,7 +118,7 @@ def get_inps(model, data_iterable, args, dev, nsamples=None):
     return inps, forward_args
 
 @torch.no_grad()
-def collect_quant_bf_loss(model, dataloader, args, device):
+def cal_qlpw(model, dataloader, args, device):
     print("\nStarting sensitivity collection ...")
 
     inps, forward_args = get_inps(
@@ -172,13 +134,10 @@ def collect_quant_bf_loss(model, dataloader, args, device):
     save = getattr(args, "save", False)
 
     layers = get_layers(model)
-    quant_bf_loss = {}
-    bf_errors = {}
+    quant_loss_per_weight = {}
 
-    seed = args.seed
     for i in range(len(layers)):
-        quant_bf_loss[i] = {}
-        bf_errors[i] = {}
+        quant_loss_per_weight[i] = {}
         print(f"\n---------------- Layer {i} of {len(layers)} ----------------")
         start_time = time.time()
         
@@ -228,8 +187,7 @@ def collect_quant_bf_loss(model, dataloader, args, device):
             torch.cuda.empty_cache()
             for sublayer_name in subset:
                 print(f"Collecting quant_bf-ed of module {sublayer_name} of layer {i}")
-                quant_bf_loss[i][sublayer_name] = spqr_handler[sublayer_name].collect_quant_bf_loss(
-                    layer_name=sublayer_name,
+                quant_loss_per_weight[i][sublayer_name] = spqr_handler[sublayer_name].quant_loss_per_weight(
                     percdamp=args.percdamp,
                     bits=args.wbits,
                     groupsize=args.groupsize,
@@ -237,19 +195,11 @@ def collect_quant_bf_loss(model, dataloader, args, device):
                     perchannel=args.perchannel,
                     round_zero=args.round_zero,
                     permutation_order=args.permutation_order,
-                    ber=args.ber,
-                    seed=seed,
-                    percentile=args.percentile,
-                    error_extract=args.error_extract,
-                    with_sign=args.with_sign,
-                    target_layer = args.target_layer,
                 )
-                seed = seed + 10
 
-    return quant_bf_loss
+    return quant_loss_per_weight
 
-
-def get_quant_bf_loss(model, args, device):
+def get_quant_loss_per_weight(model, args, device):
     tick = time.time()
     print("Loading data ...")
     dataloader = get_loaders(
@@ -260,7 +210,7 @@ def get_quant_bf_loss(model, args, device):
         seqlen=model.seqlen,
     )
 
-    results = collect_quant_bf_loss(model, dataloader, args, device)
+    results = cal_qlpw(model, dataloader, args, device)
 
     print(f"quant_bf time: {time.time() - tick:.1f}")
     return results
@@ -270,19 +220,16 @@ def main():
 
     parser = argparse.ArgumentParser(add_help=True)
 
-    parser.add_argument(
-        "model_path",
+    parser.add_argument("model_path",
         type=str,
         help="path to llama model to load, as in LlamaForCausalLM.from_pretrained()",
     )
-    parser.add_argument(
-        "dataset",
+    parser.add_argument("dataset",
         type=str,
         default="none",
         help="Dataset name [c4, pajama, refinedweb, none, etc.] or path to data where to extract calibration data from.",
     )
-    parser.add_argument(
-        "--custom_data_path",
+    parser.add_argument("--custom_data_path",
         type=str,
         default=None,
         help="Path to load if specified. Deprecated",
@@ -291,126 +238,102 @@ def main():
     parser.add_argument("--save", type=str, default=False, help="Path to save quantized statistics.")
     parser.add_argument("--seed", type=int, default=0, help="Seed for sampling the calibration data.")
     parser.add_argument("--nsamples", type=int, default=128, help="Number of calibration data samples.")
-    parser.add_argument(
-        "--percdamp",
+    parser.add_argument("--percdamp",
         type=float,
         default=0.01,
         help="Percent of the average Hessian diagonal to use for dampening.",
     )
     parser.add_argument("--nearest", action="store_true", help="Whether to run the RTN baseline.")
-    parser.add_argument(
-        "--wbits",
+    parser.add_argument("--wbits",
         type=int,
         default=16,
         help="#bits to use for quantization; use 16 for evaluating base model.",
     )
-    parser.add_argument(
-        "--groupsize",
+    parser.add_argument("--groupsize",
         type=int,
         default=None,
         help="How many weight columns (input features) are quantized with the same statistics, default = all of them",
     )
-    parser.add_argument(
-        "--permutation_order",
+    parser.add_argument("--permutation_order",
         type=str,
         default="identity",
         help="Weights permutation order; options: identity(default), spearman, act_order",
     )
-    parser.add_argument(
-        "--true-sequential",
+    parser.add_argument("--true-sequential",
         action="store_true",
         help="Whether to run in true sequential model.",
     )
-    parser.add_argument(
-        "--new_eval",
+    parser.add_argument("--new_eval",
         action="store_true",
         help="if this is set, evaluate on new (and slightly more realistic!) val dataset versions",
     )
     parser.add_argument("--sym", action="store_true", help="Symmetric quantization")
-    parser.add_argument(
-        "--perchannel",
+    parser.add_argument("--perchannel",
         action="store_true",
         help="fit a unique quantizer to each output dim",
     )
-    parser.add_argument(
-        "--qq_scale_bits",
+    parser.add_argument("--qq_scale_bits",
         type=int,
         default=None,
         help="Quantize quantization scale with this many bits (default=do not quantize)",
     )
-    parser.add_argument(
-        "--round_zero",
+    parser.add_argument("--round_zero",
         type=int,
         default=None,
         help='whether to allow non-integer "zero" when quantizing weights non-symmetrically',
     )
-    parser.add_argument(
-        "--qq_zero_bits",
+    parser.add_argument("--qq_zero_bits",
         type=int,
         default=None,
         help='Quantize quantization "zero" with this many bits (default=do not quantize)',
     )
-    parser.add_argument(
-        "--qq_zero_sym",
+    parser.add_argument("--qq_zero_sym",
         action="store_true",
         help="enable sym=True in meta-quantization for groupwise zero, specifically",
     )
-    parser.add_argument(
-        "--qq_groupsize",
+    parser.add_argument("--qq_groupsize",
         type=int,
         default=16,
         help="Quantize quantization scale in groups of this many scales",
     )
-    parser.add_argument(
-        "--outlier_threshold",
+    parser.add_argument("--outlier_threshold",
         type=float,
         default=float("inf"),
         help="relative threshold for     outliers; higher threshold = more outliers.",
     )
-    parser.add_argument(
-        "--simplified_outliers",
+    parser.add_argument("--simplified_outliers",
         action="store_true",
         help="do not perform leave-one-out evaluation when detecting outliers; works faster, but generally worse in perplexity",
     )
     parser.add_argument("--wandb", action="store_true", help="Whether to use wandb or store locally.")
-    parser.add_argument(
-        "--skip_out_loss",
+    parser.add_argument("--skip_out_loss",
         action="store_true",
         help="Whether to skip computation of out loss.",
     )
-    parser.add_argument(
-        "--offload_activations",
+    parser.add_argument("--offload_activations",
         action="store_true",
         help="Offload activations to RAM to save GPU memory.",
     )
-    parser.add_argument(
-        "--dtype",
+    parser.add_argument("--dtype",
         type=str,
         default="auto",
         choices=["auto", "float16", "float32"],
         help="dtype to load the model.",
     )
-    parser.add_argument(
-        "--ber",
+    parser.add_argument("--ber",
         type=float,
     )
-    parser.add_argument(
-        "--percentile",
+    parser.add_argument("--percentile",
         type=float,
     )
-    parser.add_argument(
-        "--error_extract",
+    parser.add_argument("--quant_only",
         action="store_true",
+        help="get only baseline quant.",
     )
-    parser.add_argument(
-        "--with_sign",
+    parser.add_argument("--per_weight_loss",
         action="store_true",
-    )
-    parser.add_argument(
-        "--target_layer",
-        type=str, nargs='+', help="List of layer names"
-    )
-
+        help="get only baseline quant.",
+        )
     args = parser.parse_args()
 
     if args.dataset == "custom":
@@ -443,40 +366,22 @@ def main():
     model = get_model(args.model_path, args.load, args.dtype).train(False)
     # quantization + error 로 인한 sensitivity 변화 관찰
     
-    results = get_quant_bf_loss(model, args, device)
+    results = get_quant_loss_per_weight(model, args, device)
 
     df = pd.DataFrame(results)
 
-    if args.groupsize is not None:
-        if args.error_extract:
-            results_name = f'errors-w{args.wbits}-gs{args.groupsize}-bf{args.ber:.0e}-seed{args.seed}.pt'
+    if args.quant_only:
+        if args.per_weight_loss:
+            results_name = f'opt-125m-w{args.wbits}-gs{args.groupsize}-pwl.pt'
+            folder_name = 'quant_pwl_results'
         else:
-            results_name = f'opt-125m-w{args.wbits}-gs{args.groupsize}-bf{args.ber:.0e}-seed{args.seed}.pt'
+            results_name = f'opt-125m-w{args.wbits}.pt'
+            folder_name = 'quant_results'
     else:
-        if args.error_extract:
-            results_name = f'errors-w{args.wbits}-bf{args.ber:.0e}-seed{args.seed}.pt'
-        else:
-            results_name = f'opt-125m-w{args.wbits}-bf{args.ber:.0e}-seed{args.seed}.pt'
+        results_name = f'opt-125m-w{args.wbits}-bf{args.ber:.0e}-seed{args.seed}.pt'
+        folder_name = 'quant_bf_results'
     
-    if args.error_extract:
-        folder_name = 'errors'
-    else:
-        if args.with_sign:
-            folder_name = 'quant_bf_results_nogroups_w_sign'
-        else:
-            folder_name = 'quant_bf_results_nogroups'
-    
-    if not os.path.exists(folder_name):
-        os.makedirs(folder_name)
-        print(f"Directory Created: {folder_name}")
-    else:
-        print(f'Directory already exists: {folder_name}')
-        
     torch.save(df.to_dict(), f'{folder_name}/{results_name}')
-    #torch.save(df_err.to_dict(), f'{folder_name}/{errors_name}')
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
-    print(f'eval. quant bf model: {evaluate_perplexity(model.to(device), tokenizer)}')
-    
 if __name__ == '__main__':
     main()

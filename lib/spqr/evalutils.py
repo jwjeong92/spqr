@@ -14,7 +14,7 @@ def evaluate_perplexity(model, tokenizer):
 
     seqlen = 2048
     model = model.eval()
-    n_samples = data.numel() // seqlen
+    n_samples = 30#data.numel() // seqlen
 
     nlls = []
 

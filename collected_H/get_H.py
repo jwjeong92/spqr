@@ -96,6 +96,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = get_model(args.model_path).train(False)
     
+    # get_hessian_matrix는 perm, dead, ordered H_inv_diag를 반환함
     results = get_hessian_matrix(model, args, device)
 
     df = pd.DataFrame(results)

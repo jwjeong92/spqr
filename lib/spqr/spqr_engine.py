@@ -10,75 +10,7 @@ import numpy as np
 
 from .quant_groups import Quantizer, dequantize, quantize
 from .weight_permutation import get_permutation_order
-
-def calculate_bit_error_injection_mask_quantized(X, ber=1e-2, seed=42, bitwidth=8, percentile=99):
-    gen = torch.Generator()
-    gen.manual_seed(seed)
-    
-    # 상위 1%를 outlier로 지정하는 mask 생성
-    threshold = torch.quantile(X, percentile / 100.0) if percentile != 100 else torch.max(X)
-    outlier_mask = (X > threshold).to(torch.float32)
-    
-    # 오류를 주입할 대상 위치: outlier가 아닌 부분
-    error_injection_mask = (outlier_mask == 0).to(torch.bool)
-    
-    # 유효 비트 수 기준으로 전체 비트 수 계산 및 BER 목표에 맞는 비트 오류 수 계산
-    total_bits = X.numel() * bitwidth
-    target_error_bits = int(total_bits * ber)
-
-    # 오류를 주입할 수 있는 eligible 비트 위치
-    eligible_indices = torch.nonzero(error_injection_mask.flatten(), as_tuple=False).view(-1)
-    eligible_bits = eligible_indices.numel() * bitwidth
-    
-    if eligible_bits < target_error_bits:
-        print("경고: 주어진 BER을 맞추기에 충분한 비트가 없습니다.")
-        target_error_bits = eligible_bits
-
-    # eligible_indices에서 비트 위치별 인덱스 생성
-    eligible_bit_indices = eligible_indices.repeat_interleave(bitwidth) * bitwidth + torch.arange(bitwidth).repeat(eligible_indices.size(0)).to(eligible_indices.device)
-
-    # 무작위로 target_error_bits 개수만큼 선택
-    selected_bit_indices = eligible_bit_indices[torch.randperm(eligible_bit_indices.size(0), generator=gen)[:target_error_bits]]
-
-    # 최종 오류 마스크 생성
-    final_error_mask = torch.zeros(X.numel() * bitwidth, dtype=torch.bool)
-    final_error_mask[selected_bit_indices] = True
-
-    packed_error_mask = torch.zeros(X.numel(), dtype=torch.int32)
-    for i in range(bitwidth):
-        packed_error_mask |= (final_error_mask.view(X.numel(), bitwidth)[:, i].int() << i)
-    
-
-    # 비트 위치별 패킹을 벡터화하여 수행
-    #shifts = 2 ** torch.arange(bitwidth, dtype=torch.int32)  # [1, 2, 4, 8, ..., 2^(bitwidth-1)]
-    #packed_error_mask = (final_error_mask.view(X.numel(), bitwidth).int() * shifts).sum(dim=1)
-
-    return packed_error_mask
-
-
-def inject_bit_errors_packed(X, packed_error_mask):
-    # 원본 데이터와 패킹된 오류 마스크에 XOR 연산 적용
-    X_int = X.to(torch.int32)  # 원본 데이터의 정수형 변환
-    modified_X_int = X_int ^ packed_error_mask  # XOR 연산으로 오류 주입
-    return modified_X_int.to(X.dtype)  # 원래 데이터 타입으로 변환
-
-def verify_error_injection(final_error_mask, error_injection_mask, bitwidth=8):
-    # 오류 주입이 정상적으로 이루어졌는지 확인
-    
-    # 1. 오류 주입 갯수 확인
-    injected_errors = final_error_mask.sum().item()
-    print(f"총 오류 주입 비트 수: {injected_errors}")
-    
-    # 2. 오류가 outlier 제외한 위치에만 주입되었는지 확인
-    eligible_positions = error_injection_mask.sum().item()
-    mask_eligible_errors = final_error_mask[error_injection_mask].sum().item()
-    print(f"outlier 제외 위치에서 발생한 오류 수: {mask_eligible_errors}")
-    
-    if injected_errors == mask_eligible_errors:
-        print("검증 성공: 오류가 정상적으로 outlier가 아닌 위치에만 주입되었습니다.")
-    else:
-        print("검증 실패: 일부 오류가 outlier 위치에 주입되었습니다.")
-
+from .errorutils import error_injection
 
 class SPQRUtil:
     """Learns GPTQ for a single linear layer"""
@@ -108,11 +40,11 @@ class SPQRUtil:
     def collect_H_inv(
         self,
         *,
-        percdamp: float = 1e-2,
+        percdamp: float = 1e0,
         permutation_order: Union[str, torch.Tensor] = "identity",
         keep_H: bool = True,
     ):
-        '''
+        
         weight = self.layer.weight.detach().to(dtype=torch.float, copy=True)
         perm = get_permutation_order(self.H, weight, permutation_order)
         
@@ -134,12 +66,7 @@ class SPQRUtil:
         H_inv = torch.cholesky_inverse(torch.linalg.cholesky(H))
         H_inv_diag = torch.diag(H_inv)
 
-        if permutation_order != "identity":
-            invperm = torch.argsort(perm)
-            H_inv_diag = H_inv_diag[invperm]
-        '''
-
-        return self.H.to("cpu")
+        return perm, self.dead, H_inv_diag
 
     def collect_quant_loss(
         self,
@@ -310,12 +237,12 @@ class SPQRUtil:
 
         if layer_name in target_layer:
             # generate error matrix
-            bf_tensor = calculate_bit_error_injection_mask_quantized(
+            bf_tensor = error_injection( # param, rate, seed, wbits, device
                 quant_sensitivity,
-                ber = ber,
+                rate = ber,
                 seed = seed,
-                bitwidth = bits,
-                percentile=percentile # wo outlier
+                wbits = bits,
+                device = weight.device
             ).reshape_as(quant_weight).to(quant_weight.device)
             if error_extract:
                 if permutation_order != "identity":
@@ -399,8 +326,8 @@ class SPQRUtil:
 
         qweight = quantize(weight, quantizer.scale, quantizer.zero, quantizer.maxq)
         qweight = qweight[scale_order, :]
-        err_matrix = calculate_bit_error_injection_mask_quantized(
-            qweight, ber, seed, bits, percentile=100
+        err_matrix = error_injection( #param, rate, seed, wbits, device
+            param=qweight, rate=ber, seed=seed, wbits=bits, device=weight.device
         ).reshape(qweight.shape)
         err_mask_row = round(weight.shape[0] * (percentile/100))
         err_mask_col = round(weight.shape[1] * (percentile/100))

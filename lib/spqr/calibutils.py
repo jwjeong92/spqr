@@ -100,9 +100,9 @@ def insert_catcher(model, dataloader, args, device):
 
     layers = get_layers(model)
 
-    H = {}
+    perm_dead_ordered_H_inv_diag = {}
     for i in range(len(layers)):
-        H[i] = {}
+        perm_dead_ordered_H_inv_diag[i] = {}
         print(f"\n---------------- Layer {i} of {len(layers)} ----------------")
         start_time = time.time()
         
@@ -147,12 +147,12 @@ def insert_catcher(model, dataloader, args, device):
             torch.cuda.empty_cache()
             for sublayer_name in subset:
                 print(f"Collecting quant_bf-ed of module {sublayer_name} of layer {i}")
-                H[i][sublayer_name] = spqr_handler[sublayer_name].collect_H_inv(
+                perm_dead_ordered_H_inv_diag[i][sublayer_name] = spqr_handler[sublayer_name].collect_H_inv(
                     percdamp=args.percdamp,
                     permutation_order=args.permutation_order,
                 )
 
-    return H
+    return perm_dead_ordered_H_inv_diag
 
 def get_hessian_matrix(model, args, device):
     tick = time.time()
